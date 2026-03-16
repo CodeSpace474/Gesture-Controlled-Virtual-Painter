@@ -1,0 +1,153 @@
+import cv2
+import mediapipe as mp
+import pygame
+import numpy as np
+import time
+import os
+
+# --- 1. SETUP ---
+pygame.init()
+WIDTH, HEIGHT = 1280, 720
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+canvas = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+clock = pygame.time.Clock()
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(SCRIPT_DIR, 'hand_landmarker.task')
+
+latest_result = None
+def result_callback(result, output_image, timestamp_ms):
+    global latest_result
+    latest_result = result
+
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=VisionRunningMode.LIVE_STREAM,
+    result_callback=result_callback
+)
+
+# --- 2. PAINTER STATE ---
+# Note: Eraser is now marked with a special flag
+colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), "ERASER"]
+current_color = colors[0]
+brush_thickness = 10
+prev_pos = None
+
+dwell_target = None
+dwell_start_time = 0
+DWELL_DURATION = 3.0
+curr_x, curr_y = WIDTH//2, HEIGHT//2
+
+# --- 3. MAIN LOOP ---
+with HandLandmarker.create_from_options(options) as landmarker:
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+    ts = 0
+
+    while True:
+        success, frame = cap.read()
+        if not success: continue
+        
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        
+        ts += 1
+        landmarker.detect_async(mp_image, ts)
+
+        bg_surface = pygame.surfarray.make_surface(np.transpose(rgb_frame, (1, 0, 2)))
+        screen.blit(bg_surface, (0, 0))
+
+        if latest_result and latest_result.hand_landmarks:
+            for hand_lms in latest_result.hand_landmarks:
+                wst, thm, idx = hand_lms[0], hand_lms[4], hand_lms[8]
+                mid, rng, pnk = hand_lms[12], hand_lms[16], hand_lms[20]
+
+                # --- FIST DETECTION (Global Clear) ---
+                tips = [thm, idx, mid, rng, pnk]
+                if all(np.hypot(t.x - wst.x, t.y - wst.y) < 0.18 for t in tips):
+                    canvas.fill((0, 0, 0, 0))
+
+                # --- POSITION & DYNAMIC SIZE ---
+                tx, ty = idx.x * WIDTH, idx.y * HEIGHT
+                curr_x += (tx - curr_x) * 0.3
+                curr_y += (ty - curr_y) * 0.3
+                
+                dist_ti = np.hypot(idx.x - thm.x, idx.y - thm.y)
+                brush_thickness = int(np.interp(dist_ti, [0.03, 0.2], [5, 50]))
+
+                # --- Z-AXIS VIRTUAL GLASS ---
+                is_pushing = (wst.z - idx.z) > 0.06
+
+                # --- DWELL MENU LOGIC ---
+                if curr_y < 120:
+                    btn_w = WIDTH // len(colors)
+                    btn_idx = int(curr_x // btn_w)
+                    btn_idx = max(0, min(btn_idx, len(colors)-1))
+
+                    if dwell_target == btn_idx:
+                        elapsed = time.time() - dwell_start_time
+                        angle = (elapsed / DWELL_DURATION) * 360
+                        pygame.draw.arc(screen, (255, 255, 255), (int(curr_x)-45, int(curr_y)-45, 90, 90), 0, np.radians(angle), 10)
+                        
+                        if elapsed >= DWELL_DURATION:
+                            current_color = colors[btn_idx]
+                            dwell_target = None
+                    else:
+                        dwell_target = btn_idx
+                        dwell_start_time = time.time()
+                    prev_pos = None
+                else:
+                    dwell_target = None
+                    # --- DRAWING / ERASING ---
+                    if is_pushing:
+                        if prev_pos:
+                            if current_color == "ERASER":
+                                # SPECIAL BLEND: Subtracts alpha to erase
+                                pygame.draw.circle(canvas, (0, 0, 0, 0), (int(curr_x), int(curr_y)), brush_thickness * 2)
+                            else:
+                                pygame.draw.line(canvas, current_color, prev_pos, (int(curr_x), int(curr_y)), brush_thickness)
+                        prev_pos = (int(curr_x), int(curr_y))
+                    else:
+                        prev_pos = None
+
+                # Cursor Preview
+                c_col = (255, 255, 255) if current_color == "ERASER" else current_color
+                pygame.draw.circle(screen, c_col, (int(curr_x), int(curr_y)), brush_thickness, 2 if not is_pushing else 0)
+
+        # --- DRAW MENU UI ---
+        menu_overlay = pygame.Surface((WIDTH, 120), pygame.SRCALPHA)
+        menu_overlay.fill((255, 255, 255, 140))
+        screen.blit(menu_overlay, (0, 0))
+        
+        for i, col in enumerate(colors):
+            bw = WIDTH // len(colors)
+            is_active = (current_color == col)
+            
+            # Draw Color Buttons
+            rect_col = (200, 200, 200) if col == "ERASER" else col
+            pygame.draw.rect(screen, rect_col, (i*bw+15, 15, bw-30, 90), border_radius=15)
+            
+            # Active Selection Highlight
+            if is_active:
+                pygame.draw.rect(screen, (0, 0, 0), (i*bw+15, 15, bw-30, 90), 5, 15)
+            
+            if col == "ERASER":
+                lbl = pygame.font.SysFont("Impact", 28).render("ERASER", True, (0,0,0))
+                screen.blit(lbl, (i*bw + bw//4, 45))
+
+        screen.blit(canvas, (0, 0))
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                cap.release(); pygame.quit(); exit()
+
+        pygame.display.flip()
+        clock.tick(60)
+
